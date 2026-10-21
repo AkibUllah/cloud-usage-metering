@@ -1,3 +1,4 @@
+<!-- topics: fastapi,python,cloud,metering,billing,openstack,usage-based-pricing,sqlalchemy,saas -->
 # Cloud Usage Metering
 
 Usage metering, rating and invoicing for cloud resources: compute hours, GB-hours of storage, floating IPs and bandwidth, priced with tiered and regional plans and turned into invoices and budget alerts.
