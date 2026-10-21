@@ -8,6 +8,15 @@ Usage metering, rating and invoicing for cloud resources: compute hours, GB-hour
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
+## Try it live
+
+| | |
+|---|---|
+| API reference | https://akibullah.github.io/cloud-usage-metering/ — Swagger UI built from the exported OpenAPI document (static; no backend behind it) |
+| Run in your browser | [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/AkibUllah/cloud-usage-metering?quickstart=1) — starts API + PostgreSQL with `docker compose` and runs the simulator (a BDT plan, three tenants, three days of hourly usage, invoices); open forwarded port 8000 at `/docs`. |
+| One-click deploy | [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/AkibUllah/cloud-usage-metering) — `render.yaml` provisions the web service and a free PostgreSQL; `API_KEY` is generated, so send it as `X-API-Key` (or run the simulator with `--api-key`). |
+| Local | `docker compose up` (see Quick Start) |
+
 ## Why this exists
 
 Running an OpenStack-based cloud for customers means turning Ceilometer-style samples into bills that survive scrutiny: a server that ran 37 minutes must be charged 37 minutes, the first floating IP must stay free, egress must be priced in graduated tiers, and replaying a batch of samples must never double-bill anyone. This service is that pipeline, written to be exact (Decimal end to end, no floats), idempotent (sample ids are the dedupe key, invoices regenerate in place) and testable without infrastructure.

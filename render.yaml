@@ -1,0 +1,34 @@
+# Render blueprint: API + managed PostgreSQL.
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: cloud-usage-metering
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: "8000"
+      - key: ENVIRONMENT
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: DEFAULT_CURRENCY
+        value: BDT
+      - key: RATING_GRANULARITY
+        value: hour
+      - key: DATABASE_URL
+        fromDatabase:
+          name: metering-db
+          property: connectionString
+      - key: API_KEY
+        generateValue: true
+
+databases:
+  - name: metering-db
+    plan: free
+    databaseName: metering
+    user: metering
