@@ -5,6 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,6 +22,16 @@ class Settings(BaseSettings):
     default_currency: str = "BDT"
     rating_granularity: Literal["hour", "day"] = "hour"
     max_batch_size: int = 1000
+
+    @field_validator("database_url")
+    @classmethod
+    def _normalise_database_url(cls, value: str) -> str:
+        """Managed Postgres (Render, Heroku) hands out ``postgres://`` or ``postgresql://`` URLs;
+        SQLAlchemy needs the installed psycopg 3 driver spelled out."""
+        for prefix in ("postgres://", "postgresql://"):
+            if value.startswith(prefix):
+                return "postgresql+psycopg://" + value[len(prefix) :]
+        return value
 
 
 @lru_cache(maxsize=1)
