@@ -82,12 +82,12 @@ class TenantSim:
 
 def build_tenants(count: int, rng: random.Random) -> list[TenantSim]:
     catalogue = [
-        ("pathao-labs", "Pathao Labs", "dhaka-1"),
-        ("chaldal-infra", "Chaldal Infrastructure", "dhaka-1"),
-        ("shohoz-platform", "Shohoz Platform", "ctg-1"),
-        ("brac-digital", "BRAC Digital", "dhaka-1"),
-        ("sheba-xyz", "Sheba Platform", "dhaka-1"),
-        ("bkash-sandbox", "bKash Developer Sandbox", "ctg-1"),
+        ("swift-courier", "Swift Courier", "dhaka-1"),
+        ("demo-grocer-infra", "Demo Grocer Infrastructure", "dhaka-1"),
+        ("riverline-tickets", "Riverline Tickets", "ctg-1"),
+        ("delta-agro-digital", "Delta Agro Digital", "dhaka-1"),
+        ("sundarban-services", "Sundarban Services", "dhaka-1"),
+        ("demo-wallet-sandbox", "Demo Wallet Sandbox", "ctg-1"),
     ]
     tenants: list[TenantSim] = []
     for tid, name, region in catalogue[:count]:

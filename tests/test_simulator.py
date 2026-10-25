@@ -50,4 +50,4 @@ def test_cli_writes_json_file(simulator, tmp_path):
 
     data = json.loads(out.read_text())
     assert len(data["samples"]) > 0
-    assert data["samples"][0]["tenant_id"] == "pathao-labs"
+    assert data["samples"][0]["tenant_id"] == "swift-courier"
