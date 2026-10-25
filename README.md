@@ -4,6 +4,8 @@
 Usage metering, rating and invoicing for cloud resources: compute hours, GB-hours of storage, floating IPs and bandwidth, priced with tiered and regional plans and turned into invoices and budget alerts.
 
 [![CI](https://github.com/AkibUllah/cloud-usage-metering/actions/workflows/ci.yml/badge.svg)](https://github.com/AkibUllah/cloud-usage-metering/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/AkibUllah/cloud-usage-metering/actions/workflows/codeql.yml/badge.svg)](https://github.com/AkibUllah/cloud-usage-metering/actions/workflows/codeql.yml)
+[![Release](https://img.shields.io/github/v/release/AkibUllah/cloud-usage-metering)](https://github.com/AkibUllah/cloud-usage-metering/releases)
 ![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -16,6 +18,16 @@ Usage metering, rating and invoicing for cloud resources: compute hours, GB-hour
 | Run in your browser | [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/AkibUllah/cloud-usage-metering?quickstart=1) — starts API + PostgreSQL with `docker compose` and runs the simulator (a BDT plan, three tenants, three days of hourly usage, invoices); open forwarded port 8000 at `/docs`. |
 | One-click deploy | [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/AkibUllah/cloud-usage-metering) — `render.yaml` provisions the web service and a free PostgreSQL; `API_KEY` is generated, so send it as `X-API-Key` (or run the simulator with `--api-key`). |
 | Local | `docker compose up` (see Quick Start) |
+
+## Screenshots
+
+![Swagger UI API reference](docs/images/api-reference.png)
+
+Live API reference on GitHub Pages: plans, tenants, usage ingest, invoices and budgets.
+
+![simulator run against a local API](docs/images/terminal-demo.png)
+
+A real local run: the simulator ingests three days of hourly usage for three tenants and generates invoices, a replay is fully deduplicated with identical totals, and one tenant's rated month-to-date usage.
 
 ## Why this exists
 
@@ -98,9 +110,9 @@ Sample simulator output (`--days 3 --tenants 3 --seed 42`, October 2026):
 
 ```
 samples=1368 accepted=1368 duplicates=0 rejected=0
-INV-202610-00001  Pathao Labs                  BDT       475.89  (4 lines)
-INV-202610-00002  Chaldal Infrastructure       BDT      1066.98  (4 lines)
-INV-202610-00003  Shohoz Platform              BDT       386.77  (5 lines)
+INV-202610-00001  Swift Courier                BDT       475.89  (4 lines)
+INV-202610-00002  Demo Grocer Infrastructure   BDT      1066.98  (4 lines)
+INV-202610-00003  Riverline Tickets            BDT       386.77  (5 lines)
 ```
 
 Run it again and every sample is reported as a duplicate while the invoices are regenerated with the same totals.
@@ -198,7 +210,7 @@ src/metering/
 ├── deps.py          # API key + tenant lookup dependencies
 └── routers/         # health, plans, tenants, usage, invoices, budgets
 scripts/simulate_usage.py   # realistic usage generator / end-to-end driver
-tests/                      # 50 tests, SQLite in-memory
+tests/                      # 55 tests, SQLite in-memory
 ```
 
 ## Testing
@@ -219,11 +231,11 @@ Coverage highlights:
 
 ## Roadmap
 
-- Alembic migrations (tables are created with `create_all` at startup)
-- Async rating worker so budget evaluation and invoice generation leave the request path
-- Commitment / reserved pricing (prepaid instance-hours) alongside pay-as-you-go
-- Invoice PDF rendering and a webhook sink for budget events
-- Ingest adapter for Ceilometer / Gnocchi measures
+- [ ] Alembic migrations (tables are created with `create_all` at startup) (#1)
+- [ ] Async rating worker so budget evaluation and invoice generation leave the request path (#2)
+- [ ] Commitment / reserved pricing (prepaid instance-hours) alongside pay-as-you-go (#3)
+- [ ] Invoice PDF rendering and a webhook sink for budget events (#4)
+- [ ] Ingest adapter for Ceilometer / Gnocchi measures (#5)
 
 ## License
 
