@@ -7,17 +7,47 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..budgets import evaluate_budgets
+from ..commitments import CommitmentCurrencyMismatch, Settlement
 from ..database import get_db
 from ..deps import get_tenant, require_api_key
 from ..ingest import ingest_samples
+from ..invoices import (
+    LINE_COMMITTED,
+    LINE_UNUSED_COMMITMENT,
+    LINE_USAGE,
+    build_lines,
+    line_total,
+)
 from ..models import Tenant, UsageSample
 from ..periods import parse_period, period_key
 from ..plans import NoPlanAssigned, plan_for
-from ..pricing import ZERO, quantize_money
-from ..rating import rate_tenant_window, summarize
-from ..schemas import IngestOut, SummaryLineOut, UsageBatchIn, UsageSampleOut, UsageSummaryOut
+from ..pricing import ZERO
+from ..rating import rate_period, summarize
+from ..schemas import (
+    CommitmentUsageOut,
+    IngestOut,
+    SummaryLineOut,
+    UsageBatchIn,
+    UsageSampleOut,
+    UsageSummaryOut,
+)
 
 router = APIRouter(tags=["usage"], dependencies=[Depends(require_api_key)])
+
+
+def _commitment_usage(settlement: Settlement) -> CommitmentUsageOut:
+    commitment = settlement.commitment
+    return CommitmentUsageOut(
+        commitment_id=commitment.id,
+        metric=commitment.metric,
+        region=commitment.region,
+        unit_price=commitment.unit_price,
+        entitlement=settlement.entitlement,
+        used=settlement.used,
+        unused=settlement.unused,
+        committed_amount=settlement.committed_amount,
+        unused_amount=settlement.unused_amount,
+    )
 
 
 @router.post("/v1/usage", response_model=IngestOut, status_code=status.HTTP_202_ACCEPTED)
@@ -81,7 +111,7 @@ def usage_summary(
     tenant: Tenant = Depends(get_tenant),
     db: Session = Depends(get_db),
 ) -> UsageSummaryOut:
-    """Rate the period on the fly (without persisting) and return per-metric quantities and cost."""
+    """Rate the period on the fly, without persisting, the way an invoice for it would be now."""
     try:
         start, end = parse_period(period)
     except ValueError as exc:
@@ -89,15 +119,20 @@ def usage_summary(
     granularity = request.app.state.settings.rating_granularity
     plan = plan_for(db, tenant.id, start)
     try:
-        charges = rate_tenant_window(db, tenant.id, start, end, granularity, persist=False)
-    except NoPlanAssigned as exc:
+        run = rate_period(db, tenant.id, start, end, granularity, persist=False)
+        settlements = run.settlements if plan else []
+        invoice_lines = build_lines(run.charges, plan.currency if plan else "", settlements)
+    except (NoPlanAssigned, CommitmentCurrencyMismatch) as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    lines = [SummaryLineOut(**row) for row in summarize(charges)]
     return UsageSummaryOut(
         tenant_id=tenant.id,
         period=period,
         currency=plan.currency if plan else "",
         granularity=granularity,
-        lines=lines,
-        subtotal=quantize_money(sum((ln.amount for ln in lines), ZERO)),
+        lines=[SummaryLineOut(**row) for row in summarize(run.charges)],
+        commitments=[_commitment_usage(s) for s in settlements],
+        committed_total=line_total(invoice_lines, LINE_COMMITTED),
+        unused_commitment_total=line_total(invoice_lines, LINE_UNUSED_COMMITMENT),
+        overage_total=line_total(invoice_lines, LINE_USAGE),
+        subtotal=sum((ln["amount"] for ln in invoice_lines), ZERO),
     )

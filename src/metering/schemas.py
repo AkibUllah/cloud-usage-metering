@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .metrics import is_known_metric
+from .periods import as_utc
 from .pricing import Tier, validate_tiers
 
 
@@ -162,8 +165,22 @@ class SummaryLineOut(BaseModel):
     rated_unit: str
     quantity: Decimal
     free_quantity: Decimal
+    committed_quantity: Decimal
+    committed_amount: Decimal
     amount: Decimal
     priced: bool
+
+
+class CommitmentUsageOut(BaseModel):
+    commitment_id: str
+    metric: str
+    region: str | None
+    unit_price: Decimal
+    entitlement: Decimal
+    used: Decimal
+    unused: Decimal
+    committed_amount: Decimal
+    unused_amount: Decimal
 
 
 class UsageSummaryOut(BaseModel):
@@ -172,6 +189,10 @@ class UsageSummaryOut(BaseModel):
     currency: str
     granularity: str
     lines: list[SummaryLineOut]
+    commitments: list[CommitmentUsageOut]
+    committed_total: Decimal
+    unused_commitment_total: Decimal
+    overage_total: Decimal
     subtotal: Decimal
 
 
@@ -256,6 +277,99 @@ class DiscountOut(ORMModel):
     description: str
     valid_from: datetime
     valid_to: datetime | None
+
+
+# ----------------------------------------------------------------------------- commitments
+
+
+# The bounds keep quantity x unit_price inside NUMERIC(24, 8), so no rated amount can overflow.
+CommitmentQuantity = Annotated[Decimal, Field(gt=0, max_digits=16, decimal_places=6)]
+CommitmentPrice = Annotated[Decimal, Field(ge=0, max_digits=14, decimal_places=8)]
+
+
+def _utc(value: datetime | None) -> datetime | None:
+    return None if value is None else as_utc(value)
+
+
+class CommitmentCreate(BaseModel):
+    id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$",
+        description="Optional client-chosen id, which makes a retried create safe",
+    )
+    metric: str = Field(min_length=1, max_length=128, description="Exact metric name, no globs")
+    region: str | None = Field(
+        default=None, max_length=64, description="Limit to one region; omit to cover all regions"
+    )
+    quantity: CommitmentQuantity = Field(description="Committed units per billing period")
+    unit_price: CommitmentPrice = Field(description="Price per committed unit")
+    currency: str | None = Field(
+        default=None,
+        min_length=3,
+        max_length=8,
+        description="Defaults to the currency of the plan in force at starts_at",
+    )
+    starts_at: datetime
+    ends_at: datetime | None = Field(default=None, description="Exclusive; omit for no fixed end")
+    description: str = Field(default="", max_length=255)
+
+    @field_validator("metric")
+    @classmethod
+    def exact_known_metric(cls, metric: str) -> str:
+        if any(ch in metric for ch in "*?[") or not is_known_metric(metric):
+            raise ValueError(f"{metric!r} is not an exact metric name from the registry")
+        return metric
+
+    @field_validator("starts_at", "ends_at")
+    @classmethod
+    def in_utc(cls, value: datetime | None) -> datetime | None:
+        return _utc(value)
+
+    @model_validator(mode="after")
+    def window_ok(self) -> CommitmentCreate:
+        if self.ends_at is not None and self.ends_at <= self.starts_at:
+            raise ValueError("ends_at must be after starts_at")
+        return self
+
+
+class CommitmentUpdate(BaseModel):
+    """Fields left out stay as they are. Send ``ends_at: null`` to remove a fixed end."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    quantity: CommitmentQuantity | None = None
+    unit_price: CommitmentPrice | None = None
+    starts_at: datetime | None = None
+    ends_at: datetime | None = None
+    description: str | None = Field(default=None, max_length=255)
+
+    @field_validator("starts_at", "ends_at")
+    @classmethod
+    def in_utc(cls, value: datetime | None) -> datetime | None:
+        return _utc(value)
+
+    @model_validator(mode="after")
+    def required_fields_stay_set(self) -> CommitmentUpdate:
+        for name in ("quantity", "unit_price", "starts_at", "description"):
+            if name in self.model_fields_set and getattr(self, name) is None:
+                raise ValueError(f"{name} cannot be null")
+        return self
+
+
+class CommitmentOut(ORMModel):
+    id: str
+    tenant_id: str
+    metric: str
+    region: str | None
+    quantity: Decimal
+    unit_price: Decimal
+    currency: str
+    starts_at: datetime
+    ends_at: datetime | None
+    description: str
+    created_at: datetime
 
 
 # ----------------------------------------------------------------------------- budgets

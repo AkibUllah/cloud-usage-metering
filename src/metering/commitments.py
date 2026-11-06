@@ -15,10 +15,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .models import Commitment
+from .models import Commitment, Invoice
 from .periods import as_utc, microseconds, overlap_microseconds, parse_period, period_key
 from .pricing import ZERO, D, extended_amount, prorate, quantize_charge, quantize_money
 
@@ -165,3 +165,21 @@ def load_commitments(
             )
         )
     )
+
+
+def finalized_until(
+    db: Session, tenant_id: str, starts_at: datetime, ends_at: datetime | None
+) -> datetime | None:
+    """End of the last finalized invoice period the window touches, if any.
+
+    Finalized invoices are immutable, so nothing before this instant may change: the invoice
+    already charged for it.
+    """
+    stmt = select(func.max(Invoice.period_end)).where(
+        Invoice.tenant_id == tenant_id,
+        Invoice.status == "finalized",
+        Invoice.period_end > as_utc(starts_at),
+    )
+    if ends_at is not None:
+        stmt = stmt.where(Invoice.period_start < as_utc(ends_at))
+    return db.scalar(stmt)

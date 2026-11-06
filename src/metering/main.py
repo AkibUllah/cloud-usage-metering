@@ -12,7 +12,7 @@ from sqlalchemy.engine import Engine
 from . import __version__
 from .config import Settings, get_settings
 from .database import Base, make_engine, make_session_factory
-from .routers import budgets, health, invoices, plans, tenants, usage
+from .routers import budgets, commitments, health, invoices, plans, tenants, usage
 from .schema_upgrade import upgrade_schema
 
 log = logging.getLogger("metering")
@@ -64,6 +64,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     for router in (
         health.router,
         tenants.router,
+        commitments.router,
         plans.router,
         usage.router,
         invoices.router,
