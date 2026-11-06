@@ -1,8 +1,9 @@
 PY ?= python3
 VENV ?= .venv
 BIN := $(VENV)/bin
+TEST_DATABASE_URL ?= postgresql+psycopg://metering:metering@localhost:5432/metering
 
-.PHONY: venv install dev test lint fmt run openapi docker-up docker-down clean simulate
+.PHONY: venv install dev test test-postgres lint fmt run openapi docker-up docker-down clean simulate
 
 venv:
 	$(PY) -m venv $(VENV)
@@ -18,6 +19,10 @@ run:
 
 test:
 	$(BIN)/pytest
+
+# Runs the suite on PostgreSQL; the database must be a throwaway one, as rows are deleted.
+test-postgres:
+	TEST_DATABASE_URL=$(TEST_DATABASE_URL) $(BIN)/pytest
 
 lint:
 	$(BIN)/ruff check src tests

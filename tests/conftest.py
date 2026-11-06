@@ -1,27 +1,46 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from metering.config import Settings
+from metering.database import Base, make_engine
 from metering.main import create_app
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# Unset by default, so tests run on in-memory SQLite. Point it at a throwaway PostgreSQL database
+# to run the same suite there; its rows are deleted after each test.
+DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "sqlite://")
 
 OCT1 = datetime(2026, 10, 1, tzinfo=timezone.utc)
 PLAN_START = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
 def make_settings(**overrides) -> Settings:
-    base = dict(_env_file=None, database_url="sqlite://", log_level="WARNING", environment="test")
+    base = dict(_env_file=None, database_url=DATABASE_URL, log_level="WARNING", environment="test")
     base.update(overrides)
     return Settings(**base)
+
+
+@pytest.fixture(autouse=True)
+def clean_database() -> Iterator[None]:
+    yield
+    if DATABASE_URL != "sqlite://":
+        engine = make_engine(DATABASE_URL)
+        Base.metadata.create_all(engine)
+        with engine.begin() as conn:
+            for table in reversed(Base.metadata.sorted_tables):
+                conn.execute(table.delete())
+        engine.dispose()
 
 
 @pytest.fixture
@@ -30,8 +49,10 @@ def settings() -> Settings:
 
 
 @pytest.fixture
-def app(settings: Settings):
-    return create_app(settings)
+def app(settings: Settings) -> Iterator[FastAPI]:
+    app = create_app(settings)
+    yield app
+    app.state.engine.dispose()
 
 
 @pytest.fixture
