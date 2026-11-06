@@ -5,6 +5,7 @@ from fastapi.responses import PlainTextResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ..commitments import CommitmentCurrencyMismatch
 from ..database import get_db
 from ..deps import get_tenant, require_api_key
 from ..invoices import InvoiceFinalized, finalize_invoice, generate_invoice, invoice_to_csv
@@ -41,7 +42,7 @@ def create_invoice(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     except NoPlanAssigned as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    except InvoiceFinalized as exc:
+    except (InvoiceFinalized, CommitmentCurrencyMismatch) as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
 

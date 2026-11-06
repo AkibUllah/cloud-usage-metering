@@ -180,6 +180,8 @@ class UsageSummaryOut(BaseModel):
 
 class InvoiceLineOut(ORMModel):
     position: int
+    line_type: str
+    commitment_id: str | None
     metric: str
     region: str | None
     description: str
@@ -203,6 +205,9 @@ class InvoiceOut(ORMModel):
     discount_total: Decimal
     credit_total: Decimal
     total: Decimal
+    committed_total: Decimal
+    unused_commitment_total: Decimal
+    overage_total: Decimal
     discounts_applied: list[dict]
     credits_applied: list[dict]
     lines: list[InvoiceLineOut]

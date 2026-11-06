@@ -12,7 +12,7 @@ from metering.periods import parse_period
 from metering.pricing import prorate
 from metering.rating import rate_period, summarize
 
-from .conftest import OCT1, ingest, sample
+from .conftest import OCT1, PLAN_START, ingest, sample
 
 D = Decimal
 UTC = timezone.utc
@@ -363,3 +363,191 @@ def test_summarize_keeps_one_row_per_metric_with_the_committed_part(client, db, 
     assert len(rows) == 1
     assert (rows[0]["quantity"], rows[0]["amount"]) == (D("10"), D("19"))
     assert (rows[0]["committed_quantity"], rows[0]["committed_amount"]) == (D("6"), D("9"))
+
+
+# ----------------------------------------------------------------------------- invoices
+
+
+def invoice(client) -> dict:
+    r = client.post("/v1/tenants/acme/invoices", params={"period": "2026-10"})
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def lines_of(inv: dict) -> list[tuple[str, Decimal, Decimal]]:
+    return [(ln["line_type"], D(ln["quantity"]), D(ln["amount"])) for ln in inv["lines"]]
+
+
+def test_invoice_shows_committed_overage_and_totals(client, db, tenant):
+    add(db, commitment(quantity="6", unit_price="1.50"))
+    ingest(client, [sample("c", METRIC, 1, OCT1, hours=10)])
+    inv = invoice(client)
+    assert lines_of(inv) == [("committed", D("6"), D("9.00")), ("usage", D("4"), D("10.00"))]
+    assert D(inv["committed_total"]) == D("9.00")
+    assert D(inv["overage_total"]) == D("10.00")
+    assert D(inv["unused_commitment_total"]) == 0
+    assert D(inv["subtotal"]) == D(inv["total"]) == D("19.00")
+    assert D(inv["lines"][0]["unit_price"]) == D("1.50")
+    assert inv["lines"][0]["commitment_id"] == "c1" and inv["lines"][1]["commitment_id"] is None
+    assert "beyond commitment" in inv["lines"][1]["description"]
+
+
+def test_unused_commitment_is_its_own_line(client, db, tenant):
+    add(db, commitment(quantity="100", unit_price="1.50"))
+    ingest(client, [sample("c", METRIC, 1, OCT1, hours=40)])
+    inv = invoice(client)
+    assert lines_of(inv) == [
+        ("committed", D("40"), D("60.00")),
+        ("unused_commitment", D("60"), D("90.00")),
+    ]
+    assert D(inv["unused_commitment_total"]) == D("90.00")
+    assert "unused" in inv["lines"][1]["description"]
+
+
+def test_commitment_is_billed_in_a_period_with_no_usage(client, db, tenant):
+    add(db, commitment(quantity="100", unit_price="1.50"))
+    inv = invoice(client)
+    assert lines_of(inv) == [("unused_commitment", D("100"), D("150.00"))]
+    assert inv["lines"][0]["rated_unit"] == "instance-hour"
+    assert D(inv["total"]) == D("150.00")
+
+
+def test_commitment_starting_mid_period_is_billed_pro_rata(client, db, tenant):
+    # 310 a month for the last 10 of 31 days: entitled to 100, of which 80 are used. The 10 h
+    # on 1 October happen before it starts and stay pay-as-you-go.
+    add(db, commitment(quantity="310", unit_price="1.50", starts_at=oct_(22)))
+    ingest(
+        client,
+        [
+            sample("early", METRIC, 1, OCT1, hours=10),
+            sample("late", METRIC, 1, oct_(22), hours=80),
+        ],
+    )
+    inv = invoice(client)
+    assert lines_of(inv) == [
+        ("committed", D("80"), D("120.00")),
+        ("usage", D("10"), D("25.00")),
+        ("unused_commitment", D("20"), D("30.00")),
+    ]
+    assert D(inv["subtotal"]) == D("175.00")
+
+
+def test_commitment_ending_mid_period_is_billed_pro_rata(client, db, tenant):
+    # Entitled to 100 for the first 10 days. Usage after it ends is pay-as-you-go even though
+    # the pool still has room.
+    add(db, commitment(quantity="310", unit_price="1.50", ends_at=oct_(11)))
+    ingest(
+        client,
+        [
+            sample("early", METRIC, 1, OCT1, hours=90),
+            sample("late", METRIC, 1, oct_(20), hours=4),
+        ],
+    )
+    inv = invoice(client)
+    assert lines_of(inv) == [
+        ("committed", D("90"), D("135.00")),
+        ("usage", D("4"), D("10.00")),
+        ("unused_commitment", D("10"), D("15.00")),
+    ]
+
+
+def test_commitment_spanning_two_months_prorates_each_side(client, db, tenant):
+    add(
+        db,
+        commitment(quantity="310", unit_price="1.00", starts_at=oct_(22), ends_at=OCT_END + WEEK),
+    )
+    oct_inv = invoice(client)
+    r = client.post("/v1/tenants/acme/invoices", params={"period": "2026-11"})
+    nov_inv = r.json()
+    assert D(oct_inv["unused_commitment_total"]) == D("100.00")  # 10/31 of 310
+    assert D(nov_inv["lines"][0]["quantity"]) == D("72.333333")  # 7/30 of 310
+
+
+def test_third_of_a_period_rounds_once_on_the_total_fee(client, db, tenant):
+    # 1 unit at 0.04 over 1/3 of a 30-day month is exactly 0.01333..; usage cannot change the fee.
+    nov_start, _ = parse_period("2026-11")
+    add(
+        db,
+        commitment(
+            quantity="1",
+            unit_price="0.04",
+            starts_at=nov_start,
+            ends_at=nov_start + timedelta(days=10),
+        ),
+    )
+    r = client.post("/v1/tenants/acme/invoices", params={"period": "2026-11"})
+    assert D(r.json()["lines"][0]["quantity"]) == D("0.333333")
+    assert D(r.json()["subtotal"]) == D("0.01")
+
+
+def test_subtotal_is_the_sum_of_lines_and_of_the_three_kinds(client, db, tenant):
+    add(db, commitment("a", quantity="5", unit_price="1.333"))
+    add(db, commitment("b", quantity="7", unit_price="0.777", metric="storage.volume.gb"))
+    ingest(
+        client,
+        [
+            sample("c", METRIC, 1, OCT1 + timedelta(minutes=20), hours=7.25),
+            sample("v", "storage.volume.gb", 1, OCT1, hours=3, resource_id="vol"),
+        ],
+    )
+    inv = invoice(client)
+    kinds = D(inv["committed_total"]) + D(inv["unused_commitment_total"]) + D(inv["overage_total"])
+    assert D(inv["subtotal"]) == sum(D(ln["amount"]) for ln in inv["lines"]) == kinds
+
+
+def test_discounts_leave_commitment_lines_alone(client, db, tenant):
+    add(db, commitment(quantity="6", unit_price="1.50"))
+    ingest(client, [sample("c", METRIC, 1, OCT1, hours=10)])
+    client.post(
+        "/v1/tenants/acme/discounts",
+        json={"percent": "10", "valid_from": PLAN_START.isoformat()},
+    )
+    inv = invoice(client)
+    assert D(inv["discount_total"]) == D("1.00")  # 10% of the 10.00 overage only
+    assert D(inv["total"]) == D("18.00")
+
+
+def test_credits_cover_commitment_lines(client, db, tenant):
+    add(db, commitment(quantity="100", unit_price="1.50"))
+    client.post("/v1/tenants/acme/credits", json={"amount": "50"})
+    inv = invoice(client)
+    assert D(inv["credit_total"]) == D("50.00") and D(inv["total"]) == D("100.00")
+    final = client.post(f"/v1/invoices/{inv['id']}/finalize").json()
+    assert D(final["total"]) == D("100.00") and D(final["unused_commitment_total"]) == D("150.00")
+
+
+def test_regenerating_a_draft_is_stable(client, db, tenant):
+    add(db, commitment(quantity="6", unit_price="1.50"))
+    ingest(client, [sample("c", METRIC, 1, OCT1, hours=10)])
+    first, second = invoice(client), invoice(client)
+    assert first["id"] == second["id"]
+    assert lines_of(first) == lines_of(second)
+    assert [ln["position"] for ln in second["lines"]] == [1, 2]
+
+
+def test_csv_shows_line_types_and_the_three_totals(client, db, tenant):
+    add(db, commitment(quantity="6", unit_price="1.50"))
+    ingest(client, [sample("c", METRIC, 1, OCT1, hours=10)])
+    inv = invoice(client)
+    text = client.get(f"/v1/invoices/{inv['id']}/csv").text
+    rows = text.strip().splitlines()
+    assert rows[0].endswith(",amount,currency,line_type")
+    assert rows[1].endswith(",9.00,BDT,committed") and rows[2].endswith(",10.00,BDT,usage")
+    assert "committed,9.00,BDT" in rows and "overage,10.00,BDT" in rows
+    assert "unused_commitment,0.00,BDT" in rows
+
+
+def test_invoice_refuses_a_commitment_in_another_currency(client, db, tenant):
+    item = commitment()
+    item.currency = "USD"
+    add(db, item)
+    r = client.post("/v1/tenants/acme/invoices", params={"period": "2026-10"})
+    assert r.status_code == 409 and "USD" in r.json()["detail"]
+    assert client.get("/v1/tenants/acme/invoices").json() == []
+
+
+def test_longest_metric_and_region_still_fit_the_line_description(client, db, tenant):
+    metric = f"compute.instance.{'x' * 111}"
+    item = commitment(metric=metric, region="r" * 64, quantity="1234567890.1")
+    add(db, item)
+    assert len(invoice(client)["lines"][0]["description"]) == 255

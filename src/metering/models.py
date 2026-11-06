@@ -188,6 +188,16 @@ class Invoice(Base):
     discount_total: Mapped[Decimal] = mapped_column(Money, nullable=False)
     credit_total: Mapped[Decimal] = mapped_column(Money, nullable=False)
     total: Mapped[Decimal] = mapped_column(Money, nullable=False)
+    # subtotal = committed_total + unused_commitment_total + overage_total
+    committed_total: Mapped[Decimal] = mapped_column(
+        Money, default=Decimal("0"), server_default="0", nullable=False
+    )
+    unused_commitment_total: Mapped[Decimal] = mapped_column(
+        Money, default=Decimal("0"), server_default="0", nullable=False
+    )
+    overage_total: Mapped[Decimal] = mapped_column(
+        Money, default=Decimal("0"), server_default="0", nullable=False
+    )
     discounts_applied: Mapped[list[dict]] = mapped_column(JSON, default=list, nullable=False)
     credits_applied: Mapped[list[dict]] = mapped_column(JSON, default=list, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
@@ -206,6 +216,10 @@ class InvoiceLine(Base):
         ForeignKey("invoices.id", ondelete="CASCADE"), index=True
     )
     position: Mapped[int] = mapped_column(nullable=False)
+    line_type: Mapped[str] = mapped_column(
+        String(24), default="usage", server_default="usage", nullable=False
+    )  # usage | committed | unused_commitment
+    commitment_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     metric: Mapped[str] = mapped_column(String(128), nullable=False)
     region: Mapped[str | None] = mapped_column(String(64), nullable=True)
     description: Mapped[str] = mapped_column(String(255), nullable=False)

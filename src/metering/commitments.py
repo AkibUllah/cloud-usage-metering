@@ -25,6 +25,15 @@ from .pricing import ZERO, D, extended_amount, prorate, quantize_charge, quantiz
 NO_END = datetime.max.replace(tzinfo=timezone.utc)
 
 
+class CommitmentCurrencyMismatch(Exception):
+    """The tenant's plan moved to a currency a commitment was not sold in."""
+
+    def __init__(self, commitment_id: str, committed: str, billed: str):
+        super().__init__(
+            f"commitment {commitment_id!r} is in {committed} but the invoice is in {billed}"
+        )
+
+
 def active_at(commitment: Commitment, at: datetime) -> bool:
     return as_utc(commitment.starts_at) <= as_utc(at) < _end(commitment)
 

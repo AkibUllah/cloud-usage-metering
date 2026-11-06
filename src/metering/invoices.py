@@ -1,9 +1,15 @@
-"""Invoice generation: rated charges -> lines -> discounts -> credits -> totals, plus CSV export."""
+"""Invoice generation: rated charges -> lines -> discounts -> credits -> totals, plus CSV export.
+
+An invoice has three kinds of line: ``usage`` (priced by the plan, the overage for a tenant with
+commitments), ``committed`` (usage inside a commitment, at the commitment price) and
+``unused_commitment`` (the part of a commitment that went unused, still owed at that price).
+"""
 
 from __future__ import annotations
 
 import csv
 import io
+from collections.abc import Sequence
 from datetime import datetime
 from decimal import Decimal
 from fnmatch import fnmatchcase
@@ -11,11 +17,19 @@ from fnmatch import fnmatchcase
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from .commitments import CommitmentCurrencyMismatch, Settlement
+from .metrics import resolve_metric
 from .models import Credit, Discount, Invoice, InvoiceLine, RatedCharge, Tenant
 from .periods import as_utc, parse_period, utcnow
 from .plans import NoPlanAssigned, plan_for
 from .pricing import ZERO, quantize_money
-from .rating import rate_tenant_window, summarize
+from .rating import rate_period, summarize
+
+LINE_USAGE = "usage"
+LINE_COMMITTED = "committed"
+LINE_UNUSED_COMMITMENT = "unused_commitment"
+LINE_ORDER = {LINE_COMMITTED: 0, LINE_USAGE: 1, LINE_UNUSED_COMMITMENT: 2}
+DESCRIPTION_LIMIT = InvoiceLine.__table__.c.description.type.length
 
 
 class InvoiceFinalized(Exception):
@@ -56,6 +70,7 @@ def available_credits(db: Session, tenant_id: str, at: datetime) -> list[Credit]
 
 
 def apply_discounts(lines: list[dict], discounts: list[Discount]) -> tuple[Decimal, list[dict]]:
+    """Discounts reduce pay-as-you-go usage only: a commitment price is already the agreed deal."""
     total = ZERO
     applied: list[dict] = []
     for d in discounts:
@@ -63,7 +78,8 @@ def apply_discounts(lines: list[dict], discounts: list[Discount]) -> tuple[Decim
             (
                 ln["amount"]
                 for ln in lines
-                if d.metric is None or fnmatchcase(ln["metric"], d.metric)
+                if ln["line_type"] == LINE_USAGE
+                and (d.metric is None or fnmatchcase(ln["metric"], d.metric))
             ),
             ZERO,
         )
@@ -99,24 +115,26 @@ def plan_credits(credits: list[Credit], due: Decimal) -> tuple[Decimal, list[dic
     return quantize_money(total), applied
 
 
-def build_lines(charges: list[RatedCharge], currency: str) -> list[dict]:
+def _usage_lines(charges: list[RatedCharge], committed_metrics: set[str]) -> list[dict]:
     lines: list[dict] = []
-    for pos, row in enumerate(summarize(charges), start=1):
+    for row in summarize([c for c in charges if c.commitment_id is None]):
         billable = row["quantity"] - row["free_quantity"]
         amount = quantize_money(row["amount"])
         unit_price = (row["amount"] / billable) if billable > ZERO else ZERO
         region = f" ({row['region']})" if row["region"] else ""
         free = f", {row['free_quantity']:.2f} free" if row["free_quantity"] > ZERO else ""
+        overage = ", beyond commitment" if row["metric"] in committed_metrics else ""
         note = "" if row["priced"] else " [no price configured]"
         lines.append(
             {
-                "position": pos,
+                "line_type": LINE_USAGE,
+                "commitment_id": None,
                 "metric": row["metric"],
                 "region": row["region"],
                 "rated_unit": row["rated_unit"],
                 "description": (
                     f"{row['metric']}{region}: {row['quantity']:.2f} "
-                    f"{row['rated_unit']}{free}{note}"
+                    f"{row['rated_unit']}{free}{overage}{note}"
                 ),
                 "quantity": row["quantity"],
                 "free_quantity": row["free_quantity"],
@@ -125,6 +143,72 @@ def build_lines(charges: list[RatedCharge], currency: str) -> list[dict]:
             }
         )
     return lines
+
+
+def _commitment_lines(settlement: Settlement) -> list[dict]:
+    commitment = settlement.commitment
+    spec = resolve_metric(commitment.metric)
+    rated_unit = spec.rated_unit if spec else "unit"
+    region = f" ({commitment.region})" if commitment.region else ""
+    shared = {
+        "commitment_id": commitment.id,
+        "metric": commitment.metric,
+        "region": commitment.region,
+        "rated_unit": rated_unit,
+        "free_quantity": ZERO,
+        "unit_price": commitment.unit_price,
+    }
+    lines: list[dict] = []
+    if settlement.used > ZERO:
+        lines.append(
+            {
+                **shared,
+                "line_type": LINE_COMMITTED,
+                "description": (
+                    f"{commitment.metric}{region}: {settlement.used:.2f} {rated_unit} "
+                    f"of {settlement.entitlement:.2f} committed"
+                ),
+                "quantity": settlement.used,
+                "amount": settlement.committed_amount,
+            }
+        )
+    if settlement.unused > ZERO:
+        lines.append(
+            {
+                **shared,
+                "line_type": LINE_UNUSED_COMMITMENT,
+                "description": (
+                    f"{commitment.metric}{region}: {settlement.unused:.2f} {rated_unit} "
+                    f"of {settlement.entitlement:.2f} committed, unused"
+                ),
+                "quantity": settlement.unused,
+                "amount": settlement.unused_amount,
+            }
+        )
+    return lines
+
+
+def build_lines(
+    charges: list[RatedCharge], currency: str, settlements: Sequence[Settlement] = ()
+) -> list[dict]:
+    """Lines per (metric, region): committed usage, then overage, then unused commitment."""
+    for settlement in settlements:
+        commitment = settlement.commitment
+        if commitment.currency != currency:
+            raise CommitmentCurrencyMismatch(commitment.id, commitment.currency, currency)
+
+    lines = _usage_lines(charges, {s.commitment.metric for s in settlements})
+    for settlement in settlements:
+        lines.extend(_commitment_lines(settlement))
+    lines.sort(key=lambda ln: (ln["metric"], ln["region"] or "", LINE_ORDER[ln["line_type"]]))
+    return [
+        {**ln, "position": pos, "description": ln["description"][:DESCRIPTION_LIMIT]}
+        for pos, ln in enumerate(lines, start=1)
+    ]
+
+
+def line_total(lines: list[dict], line_type: str) -> Decimal:
+    return sum((ln["amount"] for ln in lines if ln["line_type"] == line_type), ZERO)
 
 
 def generate_invoice(
@@ -142,8 +226,8 @@ def generate_invoice(
     if plan is None:
         raise NoPlanAssigned(tenant.id, start)
 
-    charges = rate_tenant_window(db, tenant.id, start, end, granularity=granularity, persist=True)
-    lines = build_lines(charges, plan.currency)
+    run = rate_period(db, tenant.id, start, end, granularity=granularity, persist=True)
+    lines = build_lines(run.charges, plan.currency, run.settlements)
     subtotal = sum((ln["amount"] for ln in lines), ZERO)
     discount_total, discounts_applied = apply_discounts(
         lines, active_discounts(db, tenant.id, start, end)
@@ -177,6 +261,9 @@ def generate_invoice(
     existing.discount_total = discount_total
     existing.credit_total = credit_total
     existing.total = quantize_money(total)
+    existing.committed_total = line_total(lines, LINE_COMMITTED)
+    existing.unused_commitment_total = line_total(lines, LINE_UNUSED_COMMITMENT)
+    existing.overage_total = line_total(lines, LINE_USAGE)
     existing.discounts_applied = discounts_applied
     existing.credits_applied = credits_applied
     existing.lines = [InvoiceLine(**ln) for ln in lines]
@@ -223,6 +310,7 @@ def invoice_to_csv(invoice: Invoice) -> str:
             "unit_price",
             "amount",
             "currency",
+            "line_type",
         ]
     )
     for ln in invoice.lines:
@@ -240,9 +328,15 @@ def invoice_to_csv(invoice: Invoice) -> str:
                 f"{ln.unit_price:.8f}",
                 f"{ln.amount:.2f}",
                 invoice.currency,
+                ln.line_type,
             ]
         )
     writer.writerow([])
+    writer.writerow(["committed", f"{invoice.committed_total:.2f}", invoice.currency])
+    writer.writerow(
+        ["unused_commitment", f"{invoice.unused_commitment_total:.2f}", invoice.currency]
+    )
+    writer.writerow(["overage", f"{invoice.overage_total:.2f}", invoice.currency])
     writer.writerow(["subtotal", f"{invoice.subtotal:.2f}", invoice.currency])
     writer.writerow(["discounts", f"-{invoice.discount_total:.2f}", invoice.currency])
     writer.writerow(["credits", f"-{invoice.credit_total:.2f}", invoice.currency])
