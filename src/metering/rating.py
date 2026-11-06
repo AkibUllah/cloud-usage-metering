@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -48,6 +49,7 @@ def prorate_sample(
     window_start: datetime,
     window_end: datetime,
     granularity: str = "hour",
+    cuts: Sequence[datetime] = (),
 ) -> list[BucketUsage]:
     """Split one sample into bucket quantities, clipped to [window_start, window_end)."""
     spec = resolve_metric(sample.metric)
@@ -61,7 +63,7 @@ def prorate_sample(
     quantity = D(sample.quantity)
 
     out: list[BucketUsage] = []
-    for b_start, b_end in iter_buckets(clip_start, clip_end, granularity):
+    for b_start, b_end in iter_buckets(clip_start, clip_end, granularity, cuts):
         overlap = overlap_microseconds(clip_start, clip_end, b_start, b_end)
         if overlap <= 0:
             continue
