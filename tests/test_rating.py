@@ -6,6 +6,7 @@ from decimal import Decimal
 import pytest
 
 from metering.models import RatedCharge, UsageSample
+from metering.periods import overlap_microseconds
 from metering.plans import NoPlanAssigned
 from metering.rating import aggregate, prorate_sample, rate_tenant_window
 
@@ -198,3 +199,20 @@ def test_persisted_rating_is_replaced_on_rerun(client, db, tenant):
     rows = db.query(RatedCharge).filter_by(tenant_id="acme").all()
     assert len(rows) == 3
     assert sum(r.amount for r in rows) == D("7.5")
+
+
+def test_overlap_is_an_exact_integer_count_of_microseconds():
+    start = datetime(2026, 10, 1, 10, tzinfo=UTC)
+    end = start + timedelta(days=31, microseconds=1)
+    overlap = overlap_microseconds(start, end, start - timedelta(hours=1), end + timedelta(hours=1))
+    assert isinstance(overlap, int)
+    assert overlap == 31 * 86_400 * 1_000_000 + 1
+    assert overlap_microseconds(start, end, end, end + timedelta(hours=1)) == 0
+
+
+def test_partial_hours_sum_back_to_the_whole_sample_exactly():
+    # 1 h 0.000001 s of usage: the split between two buckets must not lose the last microsecond.
+    start = datetime(2026, 10, 1, 10, tzinfo=UTC)
+    s = mk("compute.instance.m1.small", 3600, start, start + timedelta(hours=1, microseconds=1))
+    buckets = prorate_sample(s, OCT1, OCT1 + timedelta(days=31))
+    assert [b.quantity for b in buckets] == [D("3600"), D("0.000001")]

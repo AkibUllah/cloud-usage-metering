@@ -10,6 +10,7 @@ _PERIOD_RE = re.compile(r"^(\d{4})-(\d{2})$")
 
 HOUR = timedelta(hours=1)
 DAY = timedelta(days=1)
+MICROSECOND = timedelta(microseconds=1)
 
 
 def utcnow() -> datetime:
@@ -73,9 +74,14 @@ def iter_buckets(
         cursor += size
 
 
-def overlap_seconds(
+def microseconds(delta: timedelta) -> int:
+    """A duration as an integer count of microseconds, so no float enters the proration maths."""
+    return delta // MICROSECOND
+
+
+def overlap_microseconds(
     a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime
-) -> float:
+) -> int:
     start = max(as_utc(a_start), as_utc(b_start))
     end = min(as_utc(a_end), as_utc(b_end))
-    return max((end - start).total_seconds(), 0.0)
+    return max(microseconds(end - start), 0)

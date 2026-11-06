@@ -24,11 +24,13 @@ from sqlalchemy.orm import Session
 
 from .metrics import MetricKind, MetricSpec, resolve_metric
 from .models import RatedCharge, UsageSample
-from .periods import as_utc, iter_buckets, overlap_seconds
+from .periods import HOUR, as_utc, iter_buckets, microseconds, overlap_microseconds
 from .plans import NoPlanAssigned, PriceBook, plan_for, price_book
 from .pricing import ZERO, D, quantize_charge, rate_increment
 
 log = logging.getLogger(__name__)
+
+MICROSECONDS_PER_HOUR = microseconds(HOUR)
 
 
 @dataclass(frozen=True)
@@ -55,18 +57,18 @@ def prorate_sample(
     clip_start, clip_end = max(s_start, as_utc(window_start)), min(s_end, as_utc(window_end))
     if clip_end <= clip_start:
         return []
-    total_seconds = (s_end - s_start).total_seconds()
+    total = microseconds(s_end - s_start)
     quantity = D(sample.quantity)
 
     out: list[BucketUsage] = []
     for b_start, b_end in iter_buckets(clip_start, clip_end, granularity):
-        seconds = overlap_seconds(clip_start, clip_end, b_start, b_end)
-        if seconds <= 0:
+        overlap = overlap_microseconds(clip_start, clip_end, b_start, b_end)
+        if overlap <= 0:
             continue
         if spec.kind is MetricKind.GAUGE:
-            bucket_qty = quantity * D(seconds) / D(3600)
+            bucket_qty = quantity * overlap / MICROSECONDS_PER_HOUR
         else:
-            bucket_qty = quantity * D(seconds) / D(total_seconds)
+            bucket_qty = quantity * overlap / total
         out.append(BucketUsage(sample.metric, sample.region, b_start, b_end, bucket_qty, spec))
     return out
 
