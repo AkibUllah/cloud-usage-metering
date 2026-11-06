@@ -5,16 +5,21 @@ from decimal import Decimal
 
 import pytest
 
+from metering.budgets import month_to_date_spend
 from metering.commitments import CommitmentLedger, active_at, consumption_order, entitlement
-from metering.models import Commitment
+from metering.models import Commitment, RatedCharge
 from metering.periods import parse_period
 from metering.pricing import prorate
+from metering.rating import rate_period, summarize
+
+from .conftest import OCT1, ingest, sample
 
 D = Decimal
 UTC = timezone.utc
 METRIC = "compute.instance.m1.small"
 OCT_START, OCT_END = parse_period("2026-10")
 FEB_START, FEB_END = parse_period("2026-02")
+WEEK = timedelta(days=7)
 
 
 def commitment(
@@ -204,3 +209,157 @@ def test_settled_amounts_use_the_prorated_quantity():
     settled = CommitmentLedger([c]).settle(OCT_START, OCT_END)[0]
     assert settled.entitlement == D("0.032258")  # 1 / 31
     assert settled.unused_amount == D("0.10")
+
+
+# ----------------------------------------------------------------------------- rating
+
+
+def rate(db, granularity="hour"):
+    return rate_period(db, "acme", OCT_START, OCT_END, granularity, persist=False)
+
+
+def add(db, *items: Commitment) -> None:
+    db.add_all(items)
+    db.commit()
+
+
+def split(charges) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+    """(committed quantity, committed amount, overage quantity, overage amount)."""
+    committed = [c for c in charges if c.commitment_id]
+    overage = [c for c in charges if not c.commitment_id]
+    return (
+        sum((c.quantity for c in committed), D(0)),
+        sum((c.amount for c in committed), D(0)),
+        sum((c.quantity for c in overage), D(0)),
+        sum((c.amount for c in overage), D(0)),
+    )
+
+
+def test_usage_within_the_commitment_uses_the_commitment_price(client, db, tenant):
+    add(db, commitment(quantity="100", unit_price="1.50"))
+    ingest(client, [sample("c", METRIC, 1, OCT1, hours=10)])
+    assert split(rate(db).charges) == (D("10"), D("15"), D("0"), D("0"))
+
+
+def test_overage_uses_the_plan_price(client, db, tenant):
+    add(db, commitment(quantity="6", unit_price="1.50"))
+    ingest(client, [sample("c", METRIC, 1, OCT1, hours=10)])
+    # 6 h at 1.50 + 4 h at the plan's 2.50
+    assert split(rate(db).charges) == (D("6"), D("9"), D("4"), D("10"))
+
+
+def test_a_bucket_straddling_the_end_of_the_pool_is_split(client, db, tenant):
+    add(db, commitment(quantity="1.5", unit_price="1.00"))
+    ingest(client, [sample("c", METRIC, 1, OCT1, hours=2)])
+    rows = [(c.bucket_start.hour, c.quantity, c.amount, c.commitment_id) for c in rate(db).charges]
+    assert rows == [
+        (0, D("1"), D("1"), "c1"),
+        (1, D("0.5"), D("0.5"), "c1"),
+        (1, D("0.5"), D("1.25"), None),
+    ]
+
+
+def test_committed_usage_does_not_touch_free_or_graduated_tiers(client, db, tenant):
+    # Plan: 100 GB free, then 8.00. 300 GB: 150 committed, 100 free, 50 at 8.00.
+    add(db, commitment(metric="network.bandwidth.egress.gb", quantity="150", unit_price="3.00"))
+    ingest(client, [sample("e", "network.bandwidth.egress.gb", 300, OCT1, hours=3)])
+    charges = rate(db).charges
+    assert split(charges) == (D("150"), D("450"), D("150"), D("400"))
+    assert sum(c.free_quantity for c in charges) == D("100")
+
+
+def test_overage_walks_graduated_tiers_from_the_first_tier(client, db, tenant):
+    # 2200 GB: 100 committed, then 100 free, 1000 at 8.00 and 1000 at 6.00.
+    add(db, commitment(metric="network.bandwidth.egress.gb", quantity="100", unit_price="3.00"))
+    ingest(client, [sample("e", "network.bandwidth.egress.gb", 2200, OCT1, hours=4)])
+    assert split(rate(db).charges)[3] == D("14000")
+
+
+def test_usage_before_a_commitment_starts_stays_pay_as_you_go(client, db, tenant):
+    add(db, commitment(quantity="744", unit_price="1.00", starts_at=oct_(1, 2)))
+    ingest(client, [sample("c", METRIC, 1, OCT1, hours=4)])
+    assert split(rate(db).charges) == (D("2"), D("2"), D("2"), D("5"))
+
+
+def test_usage_after_a_commitment_ends_stays_pay_as_you_go(client, db, tenant):
+    add(db, commitment(quantity="744", unit_price="1.00", ends_at=oct_(1, 2)))
+    ingest(client, [sample("c", METRIC, 1, OCT1, hours=4)])
+    assert split(rate(db).charges) == (D("2"), D("2"), D("2"), D("5"))
+
+
+@pytest.mark.parametrize("granularity", ["hour", "day"])
+def test_boundary_inside_a_bucket_splits_usage_at_that_instant(client, db, tenant, granularity):
+    add(db, commitment(quantity="744", unit_price="1.00", starts_at=oct_(1, 10, 30)))
+    ingest(client, [sample("c", METRIC, 1, oct_(1, 10), hours=1)])
+    assert split(rate(db, granularity).charges) == (D("0.5"), D("0.5"), D("0.5"), D("1.25"))
+
+
+def test_exhausted_pool_can_be_followed_by_a_commitment_starting_later(client, db, tenant):
+    add(
+        db,
+        commitment("early", quantity="620", unit_price="1.00", ends_at=oct_(1, 2) + WEEK),
+        commitment("late", quantity="310", unit_price="2.00", starts_at=oct_(21)),
+    )
+    ingest(
+        client,
+        [
+            sample("a", METRIC, 1, OCT1, hours=2),
+            sample("b", METRIC, 1, oct_(25), hours=2),
+        ],
+    )
+    run = rate(db)
+    assert {(c.commitment_id, c.amount) for c in run.charges} == {
+        ("early", D("1")),
+        ("late", D("2")),
+    }
+
+
+def test_plain_tenants_rate_exactly_as_before(client, db, tenant):
+    ingest(client, [sample("e", "network.bandwidth.egress.gb", 150, OCT1, hours=3)])
+    run = rate(db)
+    assert run.settlements == []
+    assert [c.quantity for c in run.charges] == [D("50"), D("50"), D("50")]
+    assert all(c.commitment_id is None for c in run.charges)
+
+
+def test_commitment_of_another_tenant_is_ignored(client, db, tenant):
+    client.post("/v1/tenants", json={"id": "other", "name": "Other"})
+    other = commitment(quantity="100")
+    other.tenant_id = "other"
+    add(db, other)
+    ingest(client, [sample("c", METRIC, 1, OCT1)])
+    assert split(rate(db).charges) == (D("0"), D("0"), D("1"), D("2.5"))
+
+
+def test_unpriced_overage_is_flagged_but_committed_usage_is_billed(client, db, tenant):
+    add(db, commitment(metric="storage.snapshot.gb", quantity="4", unit_price="0.01"))
+    ingest(client, [sample("s", "storage.snapshot.gb", 10, OCT1)])
+    charges = rate(db).charges
+    assert split(charges) == (D("4"), D("0.04"), D("6"), D("0"))
+    assert [c.priced for c in charges] == [True, False]
+
+
+def test_rerating_is_deterministic_and_replaces_rows(client, db, tenant):
+    add(db, commitment(quantity="3", unit_price="1.50"))
+    ingest(client, [sample("c", METRIC, 1, OCT1, hours=5)])
+    first = rate_period(db, "acme", OCT_START, OCT_END).charges
+    db.commit()
+    second = rate_period(db, "acme", OCT_START, OCT_END).charges
+    db.commit()
+    assert split(first) == split(second)
+    assert db.query(RatedCharge).filter_by(tenant_id="acme").count() == len(second) == 5
+
+
+def test_budget_spend_counts_committed_usage(client, db, tenant):
+    add(db, commitment(quantity="100", unit_price="1.50"))
+    ingest(client, [sample("c", METRIC, 1, OCT1, hours=10)])
+    assert month_to_date_spend(db, "acme", OCT1) == D("15.00")
+
+
+def test_summarize_keeps_one_row_per_metric_with_the_committed_part(client, db, tenant):
+    add(db, commitment(quantity="6", unit_price="1.50"))
+    ingest(client, [sample("c", METRIC, 1, OCT1, hours=10)])
+    rows = summarize(rate(db).charges)
+    assert len(rows) == 1
+    assert (rows[0]["quantity"], rows[0]["amount"]) == (D("10"), D("19"))
+    assert (rows[0]["committed_quantity"], rows[0]["committed_amount"]) == (D("6"), D("9"))
