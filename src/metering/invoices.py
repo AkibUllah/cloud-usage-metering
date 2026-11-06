@@ -90,8 +90,8 @@ def apply_discounts(lines: list[dict], discounts: list[Discount]) -> tuple[Decim
         applied.append(
             {
                 "discount_id": d.id,
-                "description": d.description or f"{d.percent}% discount",
-                "percent": str(d.percent),
+                "description": d.description or f"{d.percent.normalize():f}% discount",
+                "percent": f"{d.percent.normalize():f}",
                 "metric": d.metric,
                 "amount": str(amount),
             }
