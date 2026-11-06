@@ -6,6 +6,9 @@ Examples::
     # against a running server, 3 days of hourly samples, then generate invoices
     python scripts/simulate_usage.py --base-url http://localhost:8000 --days 3 --invoice
 
+    # also sell every tenant a block of instance-hours, then show committed vs overage
+    python scripts/simulate_usage.py --days 3 --invoice --commitments
+
     # just write the samples to a JSON file
     python scripts/simulate_usage.py --days 1 --out samples.json
 
@@ -21,6 +24,7 @@ import random
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -166,6 +170,32 @@ def generate_samples(
     return samples
 
 
+def commitment_for(tenant: TenantSim, start: datetime) -> dict[str, Any]:
+    """Reserve a month of the tenant's first server at about 40% below the on-demand price."""
+    flavor = tenant.servers[0].flavor
+    metric = f"compute.instance.{flavor}"
+    on_demand = next(
+        Decimal(price["unit_price"])
+        for price in standard_plan()["prices"]
+        if price["metric"] == metric and "region" not in price
+    )
+    return {
+        "id": f"{tenant.id}-reserved",
+        "metric": metric,
+        "quantity": "24",
+        "unit_price": str(on_demand * Decimal("0.6")),
+        "starts_at": start.isoformat(),
+        "description": f"Reserved {flavor} block",
+    }
+
+
+def ensure_commitments(client, tenants: list[TenantSim], start: datetime) -> None:
+    for t in tenants:
+        r = client.post(f"/v1/tenants/{t.id}/commitments", json=commitment_for(t, start))
+        if r.status_code not in (201, 409):
+            raise SystemExit(f"creating commitment failed: {r.status_code} {r.text}")
+
+
 def chunked(items: list, size: int):
     for i in range(0, len(items), size):
         yield items[i : i + size]
@@ -198,11 +228,15 @@ def run(
     start: datetime,
     batch_size: int = 500,
     invoice: bool = False,
+    commitments: bool = False,
     log=print,
 ) -> dict[str, Any]:
     rng = random.Random(seed)
     sims = build_tenants(tenants, rng)
-    bootstrap(client, sims, effective_from=start.replace(day=1, hour=0, minute=0, second=0))
+    period_start = start.replace(day=1, hour=0, minute=0, second=0)
+    bootstrap(client, sims, effective_from=period_start)
+    if commitments:
+        ensure_commitments(client, sims, period_start)
     samples = generate_samples(sims, start, days, rng)
 
     totals = {"accepted": 0, "duplicates": 0, "rejected": 0, "budget_events": 0}
@@ -231,6 +265,12 @@ def run(
                 f"{inv['number']}  {t.name:<28} {inv['currency']} {inv['total']:>12}  "
                 f"({len(inv['lines'])} lines)"
             )
+            if commitments:
+                log(
+                    f"  committed {Decimal(inv['committed_total']):>10.2f}  "
+                    f"unused {Decimal(inv['unused_commitment_total']):>10.2f}  "
+                    f"overage {Decimal(inv['overage_total']):>10.2f}"
+                )
     return {"samples": len(samples), **totals, "invoices": invoices}
 
 
@@ -252,6 +292,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--batch-size", type=int, default=500)
     parser.add_argument("--invoice", action="store_true", help="Generate invoices after ingesting")
+    parser.add_argument(
+        "--commitments",
+        action="store_true",
+        help="Give each tenant a reserved instance-hour commitment before ingesting",
+    )
     parser.add_argument(
         "--out", default=None, help="Write samples to this JSON file instead of posting"
     )
@@ -283,6 +328,7 @@ def main(argv: list[str] | None = None) -> int:
             start=start,
             batch_size=args.batch_size,
             invoice=args.invoice,
+            commitments=args.commitments,
         )
     return 0
 
