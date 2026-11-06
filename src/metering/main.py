@@ -13,6 +13,7 @@ from . import __version__
 from .config import Settings, get_settings
 from .database import Base, make_engine, make_session_factory
 from .routers import budgets, health, invoices, plans, tenants, usage
+from .schema_upgrade import upgrade_schema
 
 log = logging.getLogger("metering")
 
@@ -30,6 +31,7 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
 
     engine = engine or make_engine(settings.database_url)
     Base.metadata.create_all(engine)
+    upgrade_schema(engine)
 
     app = FastAPI(
         title="Cloud Usage Metering",
