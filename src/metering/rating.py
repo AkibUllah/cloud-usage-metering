@@ -6,15 +6,19 @@ Steps for one tenant and billing window:
 2. Split every sample across hourly (or daily) buckets. Gauges become ``level x hours`` per bucket;
    deltas are divided proportionally to the time overlap. This is the proration step.
 3. Aggregate to (metric, region, bucket) quantities.
-4. Walk buckets chronologically, resolve the plan in force at each bucket start, and price the
-   increment with a running per-(metric, region) consumed total so free tiers and graduated tiers
-   apply across the whole period.
+4. Walk buckets chronologically and draw each one down from the tenant's active commitments at the
+   commitment price.
+5. Resolve the plan in force at the bucket start and price what the commitments did not cover,
+   with a running per-(metric, region) consumed total so free tiers and graduated tiers apply
+   across the whole period. Committed usage never counts towards that total: overage starts at
+   the first free unit and the first tier.
 """
 
 from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -22,13 +26,24 @@ from decimal import Decimal
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from .commitments import CommitmentLedger, Draw, Settlement, load_commitments
 from .metrics import MetricKind, MetricSpec, resolve_metric
 from .models import RatedCharge, UsageSample
-from .periods import as_utc, iter_buckets, overlap_seconds
+from .periods import (
+    HOUR,
+    as_utc,
+    iter_buckets,
+    microseconds,
+    overlap_microseconds,
+    parse_period,
+    period_key,
+)
 from .plans import NoPlanAssigned, PriceBook, plan_for, price_book
-from .pricing import ZERO, D, quantize_charge, rate_increment
+from .pricing import ZERO, D, extended_amount, quantize_charge, rate_increment
 
 log = logging.getLogger(__name__)
+
+MICROSECONDS_PER_HOUR = microseconds(HOUR)
 
 
 @dataclass(frozen=True)
@@ -46,6 +61,7 @@ def prorate_sample(
     window_start: datetime,
     window_end: datetime,
     granularity: str = "hour",
+    cuts: Sequence[datetime] = (),
 ) -> list[BucketUsage]:
     """Split one sample into bucket quantities, clipped to [window_start, window_end)."""
     spec = resolve_metric(sample.metric)
@@ -55,18 +71,18 @@ def prorate_sample(
     clip_start, clip_end = max(s_start, as_utc(window_start)), min(s_end, as_utc(window_end))
     if clip_end <= clip_start:
         return []
-    total_seconds = (s_end - s_start).total_seconds()
+    total = microseconds(s_end - s_start)
     quantity = D(sample.quantity)
 
     out: list[BucketUsage] = []
-    for b_start, b_end in iter_buckets(clip_start, clip_end, granularity):
-        seconds = overlap_seconds(clip_start, clip_end, b_start, b_end)
-        if seconds <= 0:
+    for b_start, b_end in iter_buckets(clip_start, clip_end, granularity, cuts):
+        overlap = overlap_microseconds(clip_start, clip_end, b_start, b_end)
+        if overlap <= 0:
             continue
         if spec.kind is MetricKind.GAUGE:
-            bucket_qty = quantity * D(seconds) / D(3600)
+            bucket_qty = quantity * overlap / MICROSECONDS_PER_HOUR
         else:
-            bucket_qty = quantity * D(seconds) / D(total_seconds)
+            bucket_qty = quantity * overlap / total
         out.append(BucketUsage(sample.metric, sample.region, b_start, b_end, bucket_qty, spec))
     return out
 
@@ -101,8 +117,36 @@ def load_samples(
     )
 
 
-def rate_buckets(db: Session, tenant_id: str, buckets: list[BucketUsage]) -> list[RatedCharge]:
+def _committed_charge(
+    tenant_id: str, plan_id: str, b: BucketUsage, draw: Draw
+) -> RatedCharge | None:
+    quantity = quantize_charge(draw.quantity)
+    if quantity <= ZERO:  # a rounding residue of the pool, too small to show as usage
+        return None
+    return RatedCharge(
+        tenant_id=tenant_id,
+        plan_id=plan_id,
+        metric=b.metric,
+        region=b.region,
+        rated_unit=b.spec.rated_unit,
+        bucket_start=b.bucket_start,
+        bucket_end=b.bucket_end,
+        quantity=quantity,
+        free_quantity=ZERO,
+        amount=quantize_charge(extended_amount(draw.quantity, draw.commitment.unit_price)),
+        priced=True,
+        commitment_id=draw.commitment.id,
+    )
+
+
+def rate_buckets(
+    db: Session,
+    tenant_id: str,
+    buckets: list[BucketUsage],
+    ledger: CommitmentLedger | None = None,
+) -> list[RatedCharge]:
     """Price aggregated buckets. Raises NoPlanAssigned if a bucket has no plan in force."""
+    ledger = ledger if ledger is not None else CommitmentLedger([])
     consumed: dict[tuple[str, str | None], Decimal] = defaultdict(lambda: ZERO)
     books: dict[str, PriceBook] = {}
     charges: list[RatedCharge] = []
@@ -111,6 +155,15 @@ def rate_buckets(db: Session, tenant_id: str, buckets: list[BucketUsage]) -> lis
         plan = plan_for(db, tenant_id, b.bucket_start)
         if plan is None:
             raise NoPlanAssigned(tenant_id, b.bucket_start)
+
+        draws, overage = ledger.draw(b.metric, b.region, b.bucket_start, b.quantity)
+        for draw in draws:
+            charge = _committed_charge(tenant_id, plan.id, b, draw)
+            if charge is not None:
+                charges.append(charge)
+        if draws and quantize_charge(overage) <= ZERO:
+            continue
+
         book = books.setdefault(plan.id, price_book(plan))
         spec = book.resolve(b.metric, b.region)
         key = (b.metric, b.region)
@@ -132,7 +185,7 @@ def rate_buckets(db: Session, tenant_id: str, buckets: list[BucketUsage]) -> lis
                     rated_unit=b.spec.rated_unit,
                     bucket_start=b.bucket_start,
                     bucket_end=b.bucket_end,
-                    quantity=quantize_charge(b.quantity),
+                    quantity=quantize_charge(overage),
                     free_quantity=ZERO,
                     amount=ZERO,
                     priced=False,
@@ -140,8 +193,8 @@ def rate_buckets(db: Session, tenant_id: str, buckets: list[BucketUsage]) -> lis
             )
             continue
 
-        result = rate_increment(spec, consumed[key], b.quantity)
-        consumed[key] += b.quantity
+        result = rate_increment(spec, consumed[key], overage)
+        consumed[key] += overage
         charges.append(
             RatedCharge(
                 tenant_id=tenant_id,
@@ -151,7 +204,7 @@ def rate_buckets(db: Session, tenant_id: str, buckets: list[BucketUsage]) -> lis
                 rated_unit=b.spec.rated_unit,
                 bucket_start=b.bucket_start,
                 bucket_end=b.bucket_end,
-                quantity=quantize_charge(b.quantity),
+                quantity=quantize_charge(overage),
                 free_quantity=quantize_charge(result.free_quantity),
                 amount=quantize_charge(result.amount),
                 priced=True,
@@ -160,20 +213,36 @@ def rate_buckets(db: Session, tenant_id: str, buckets: list[BucketUsage]) -> lis
     return charges
 
 
-def rate_tenant_window(
+@dataclass(frozen=True)
+class RatingRun:
+    charges: list[RatedCharge]
+    settlements: list[Settlement]
+
+
+def rate_period(
     db: Session,
     tenant_id: str,
     window_start: datetime,
     window_end: datetime,
     granularity: str = "hour",
     persist: bool = True,
-) -> list[RatedCharge]:
-    """Rate everything a tenant used inside the window. Re-rating replaces stored charges."""
+) -> RatingRun:
+    """Rate a tenant's window and settle its commitments for the billing period it starts in.
+
+    Commitments are always entitled per calendar billing period, so a window shorter than a period
+    does not shrink them. Re-rating replaces stored charges.
+    """
+    period_start, period_end = parse_period(period_key(window_start))
+    ledger = CommitmentLedger(
+        load_commitments(db, tenant_id, period_start, max(period_end, as_utc(window_end)))
+    )
+    cuts = ledger.cut_points(window_start, window_end)
+
     samples = load_samples(db, tenant_id, window_start, window_end)
     buckets: list[BucketUsage] = []
     for sample in samples:
-        buckets.extend(prorate_sample(sample, window_start, window_end, granularity))
-    charges = rate_buckets(db, tenant_id, aggregate(buckets))
+        buckets.extend(prorate_sample(sample, window_start, window_end, granularity, cuts))
+    charges = rate_buckets(db, tenant_id, aggregate(buckets), ledger)
 
     if persist:
         db.execute(
@@ -185,7 +254,19 @@ def rate_tenant_window(
         )
         db.add_all(charges)
         db.flush()
-    return charges
+    return RatingRun(charges, ledger.settle(period_start, period_end))
+
+
+def rate_tenant_window(
+    db: Session,
+    tenant_id: str,
+    window_start: datetime,
+    window_end: datetime,
+    granularity: str = "hour",
+    persist: bool = True,
+) -> list[RatedCharge]:
+    """Rate everything a tenant used inside the window. Re-rating replaces stored charges."""
+    return rate_period(db, tenant_id, window_start, window_end, granularity, persist).charges
 
 
 def summarize(charges: list[RatedCharge]) -> list[dict]:
@@ -200,11 +281,16 @@ def summarize(charges: list[RatedCharge]) -> list[dict]:
                 "rated_unit": c.rated_unit,
                 "quantity": ZERO,
                 "free_quantity": ZERO,
+                "committed_quantity": ZERO,
+                "committed_amount": ZERO,
                 "amount": ZERO,
                 "priced": c.priced,
             },
         )
         row["quantity"] += c.quantity
+        if c.commitment_id is not None:
+            row["committed_quantity"] += c.quantity
+            row["committed_amount"] += c.amount
         row["free_quantity"] += c.free_quantity
         row["amount"] += c.amount
         row["priced"] = row["priced"] and c.priced

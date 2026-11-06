@@ -9,14 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Commitments (reserved pricing): CRUD under `/v1/tenants/{id}/commitments`. Usage inside a commitment is rated at its price and overage falls through to the plan's free quantity and graduated tiers. Commitments that start or end mid-period are prorated by time, and their boundaries split rating buckets.
+- Invoices show committed, overage and unused commitment amounts: `line_type` and `commitment_id` on lines, `committed_total`, `unused_commitment_total` and `overage_total` on invoices, and the same split in the CSV export.
+- `/usage/summary` reports each commitment's drawdown and the same three totals.
+- `--commitments` option on the usage simulator.
+- Columns added to existing tables are applied at startup, with `overage_total` backfilled from `subtotal` on earlier invoices.
+- CI job and `make test-postgres` target running the test suite against PostgreSQL via `TEST_DATABASE_URL`.
 - CodeQL code scanning workflow and Dependabot configuration (pip, Docker, GitHub Actions).
 - API reference and terminal screenshots in the README.
 - Roadmap tracked as GitHub issues under the `v0.2.0` milestone.
 
 ### Changed
 
+- The CSV export gains a trailing `line_type` column and `committed`, `unused_commitment` and `overage` rows above `subtotal`.
+- `/usage/summary` rounds its `subtotal` per line, so it equals the invoice's.
+- Time overlap in rating is computed in integer microseconds instead of float seconds.
 - CI workflow runs with a read-only `GITHUB_TOKEN` by default.
 - The usage simulator's tenant catalogue uses fictional organization names.
+
+### Fixed
+
+- Discount labels on PostgreSQL read `50% discount`, not `50.00000000% discount`.
 
 ## [0.1.0] - 2026-10-25
 

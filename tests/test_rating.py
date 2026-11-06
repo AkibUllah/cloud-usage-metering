@@ -6,6 +6,7 @@ from decimal import Decimal
 import pytest
 
 from metering.models import RatedCharge, UsageSample
+from metering.periods import iter_buckets, overlap_microseconds
 from metering.plans import NoPlanAssigned
 from metering.rating import aggregate, prorate_sample, rate_tenant_window
 
@@ -198,3 +199,54 @@ def test_persisted_rating_is_replaced_on_rerun(client, db, tenant):
     rows = db.query(RatedCharge).filter_by(tenant_id="acme").all()
     assert len(rows) == 3
     assert sum(r.amount for r in rows) == D("7.5")
+
+
+def test_overlap_is_an_exact_integer_count_of_microseconds():
+    start = datetime(2026, 10, 1, 10, tzinfo=UTC)
+    end = start + timedelta(days=31, microseconds=1)
+    overlap = overlap_microseconds(start, end, start - timedelta(hours=1), end + timedelta(hours=1))
+    assert isinstance(overlap, int)
+    assert overlap == 31 * 86_400 * 1_000_000 + 1
+    assert overlap_microseconds(start, end, end, end + timedelta(hours=1)) == 0
+
+
+def test_partial_hours_sum_back_to_the_whole_sample_exactly():
+    # 1 h 0.000001 s of usage: the split between two buckets must not lose the last microsecond.
+    start = datetime(2026, 10, 1, 10, tzinfo=UTC)
+    s = mk("compute.instance.m1.small", 3600, start, start + timedelta(hours=1, microseconds=1))
+    buckets = prorate_sample(s, OCT1, OCT1 + timedelta(days=31))
+    assert [b.quantity for b in buckets] == [D("3600"), D("0.000001")]
+
+
+def test_buckets_are_split_at_cut_points():
+    start = datetime(2026, 10, 1, 10, tzinfo=UTC)
+    cut = start + timedelta(minutes=30)
+    edges = list(iter_buckets(start, start + timedelta(hours=2), "hour", [cut, cut]))
+    assert edges == [
+        (start, cut),
+        (cut, start + timedelta(hours=1)),
+        (start + timedelta(hours=1), start + timedelta(hours=2)),
+    ]
+
+
+def test_cut_on_a_bucket_edge_or_outside_the_range_changes_nothing():
+    start = datetime(2026, 10, 1, 10, tzinfo=UTC)
+    end = start + timedelta(hours=2)
+    plain = list(iter_buckets(start, end, "hour"))
+    cuts = [start, start + timedelta(hours=1), end + timedelta(days=1)]
+    assert list(iter_buckets(start, end, "hour", cuts)) == plain
+
+
+def test_cut_splits_a_sample_without_changing_its_total():
+    start = datetime(2026, 10, 1, 10, tzinfo=UTC)
+    s = mk("compute.instance.m1.small", 2, start, start + timedelta(hours=1))
+    cut = start + timedelta(minutes=15)
+    buckets = prorate_sample(s, OCT1, OCT1 + timedelta(days=31), cuts=[cut])
+    assert [(b.bucket_start, b.quantity) for b in buckets] == [(start, D("0.5")), (cut, D("1.5"))]
+
+
+def test_daily_buckets_split_at_a_cut_inside_the_day():
+    cut = OCT1 + timedelta(hours=6)
+    s = mk("compute.instance.m1.small", 1, OCT1, OCT1 + timedelta(hours=24))
+    buckets = prorate_sample(s, OCT1, OCT1 + timedelta(days=31), granularity="day", cuts=[cut])
+    assert [b.quantity for b in buckets] == [D("6"), D("18")]

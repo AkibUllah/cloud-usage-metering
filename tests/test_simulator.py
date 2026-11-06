@@ -51,3 +51,43 @@ def test_cli_writes_json_file(simulator, tmp_path):
     data = json.loads(out.read_text())
     assert len(data["samples"]) > 0
     assert data["samples"][0]["tenant_id"] == "swift-courier"
+
+
+def test_commitments_split_invoices_and_rerun_is_idempotent(client, simulator):
+    logs: list[str] = []
+    first = simulator.run(
+        client,
+        days=3,
+        tenants=2,
+        seed=1,
+        start=OCT1,
+        invoice=True,
+        commitments=True,
+        log=logs.append,
+    )
+    for inv in first["invoices"]:
+        kinds = {ln["line_type"] for ln in inv["lines"]}
+        assert {"committed", "usage"} <= kinds
+        assert Decimal(inv["committed_total"]) > 0
+    assert any("committed" in line and "overage" in line for line in logs)
+
+    again = simulator.run(
+        client,
+        days=3,
+        tenants=2,
+        seed=1,
+        start=OCT1,
+        invoice=True,
+        commitments=True,
+        log=logs.append,
+    )
+    assert [i["total"] for i in again["invoices"]] == [i["total"] for i in first["invoices"]]
+    assert len(client.get("/v1/tenants/swift-courier/commitments").json()) == 1
+
+
+def test_commitment_prices_are_below_on_demand(simulator):
+    rng = random.Random(3)
+    for tenant in simulator.build_tenants(3, rng):
+        spec = simulator.commitment_for(tenant, OCT1)
+        plan = {p["metric"]: p for p in simulator.standard_plan()["prices"]}
+        assert Decimal(spec["unit_price"]) < Decimal(plan[spec["metric"]]["unit_price"])

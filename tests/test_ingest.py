@@ -21,7 +21,7 @@ def test_batch_is_accepted_and_listed(client, tenant):
     assert body == {"accepted": 2, "duplicates": 0, "rejected": [], "budget_events": []}
     rows = client.get("/v1/usage", params={"tenant_id": "acme"}).json()
     assert [r["id"] for r in rows] == ["s1", "s2"]
-    assert rows[1]["quantity"] == "50"
+    assert Decimal(rows[1]["quantity"]) == 50
     only_volume = client.get("/v1/usage", params={"metric": "storage.volume.gb"}).json()
     assert [r["id"] for r in only_volume] == ["s2"]
 

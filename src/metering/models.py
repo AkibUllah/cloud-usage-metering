@@ -97,7 +97,11 @@ class PlanAssignment(Base):
 
 
 class RatedCharge(Base):
-    """Output of the rating engine: one row per (metric, region, bucket)."""
+    """Output of the rating engine: one row per (metric, region, bucket, commitment).
+
+    ``commitment_id`` is set on the part of a bucket covered by that commitment. The row without
+    one holds pay-as-you-go usage, priced by the plan.
+    """
 
     __tablename__ = "rated_charges"
     __table_args__ = (Index("ix_charges_tenant_bucket", "tenant_id", "bucket_start"),)
@@ -114,6 +118,7 @@ class RatedCharge(Base):
     free_quantity: Mapped[Decimal] = mapped_column(Money, default=Decimal("0"), nullable=False)
     amount: Mapped[Decimal] = mapped_column(Money, nullable=False)
     priced: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    commitment_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     rated_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
 
@@ -144,6 +149,29 @@ class Discount(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
 
+class Commitment(Base):
+    """A prepaid block of one metric: ``quantity`` units per billing period at ``unit_price``.
+
+    ``region`` limits it to one region; ``None`` covers usage in every region. The commitment runs
+    over ``[starts_at, ends_at)`` and an open ``ends_at`` means it has no fixed end.
+    """
+
+    __tablename__ = "commitments"
+    __table_args__ = (Index("ix_commitments_tenant_window", "tenant_id", "starts_at", "ends_at"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    metric: Mapped[str] = mapped_column(String(128), nullable=False)
+    region: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    quantity: Mapped[Decimal] = mapped_column(Money, nullable=False)
+    unit_price: Mapped[Decimal] = mapped_column(Money, nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), nullable=False)
+    starts_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    ends_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    description: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
 class Invoice(Base):
     __tablename__ = "invoices"
     __table_args__ = (UniqueConstraint("tenant_id", "period", name="uq_invoice_tenant_period"),)
@@ -160,6 +188,16 @@ class Invoice(Base):
     discount_total: Mapped[Decimal] = mapped_column(Money, nullable=False)
     credit_total: Mapped[Decimal] = mapped_column(Money, nullable=False)
     total: Mapped[Decimal] = mapped_column(Money, nullable=False)
+    # subtotal = committed_total + unused_commitment_total + overage_total
+    committed_total: Mapped[Decimal] = mapped_column(
+        Money, default=Decimal("0"), server_default="0", nullable=False
+    )
+    unused_commitment_total: Mapped[Decimal] = mapped_column(
+        Money, default=Decimal("0"), server_default="0", nullable=False
+    )
+    overage_total: Mapped[Decimal] = mapped_column(
+        Money, default=Decimal("0"), server_default="0", nullable=False
+    )
     discounts_applied: Mapped[list[dict]] = mapped_column(JSON, default=list, nullable=False)
     credits_applied: Mapped[list[dict]] = mapped_column(JSON, default=list, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
@@ -178,6 +216,10 @@ class InvoiceLine(Base):
         ForeignKey("invoices.id", ondelete="CASCADE"), index=True
     )
     position: Mapped[int] = mapped_column(nullable=False)
+    line_type: Mapped[str] = mapped_column(
+        String(24), default="usage", server_default="usage", nullable=False
+    )  # usage | committed | unused_commitment
+    commitment_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     metric: Mapped[str] = mapped_column(String(128), nullable=False)
     region: Mapped[str | None] = mapped_column(String(64), nullable=True)
     description: Mapped[str] = mapped_column(String(255), nullable=False)

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import datetime, timedelta, timezone
 
 _PERIOD_RE = re.compile(r"^(\d{4})-(\d{2})$")
 
 HOUR = timedelta(hours=1)
 DAY = timedelta(days=1)
+MICROSECOND = timedelta(microseconds=1)
 
 
 def utcnow() -> datetime:
@@ -62,20 +63,36 @@ def bucket_size(granularity: str) -> timedelta:
 
 
 def iter_buckets(
-    start: datetime, end: datetime, granularity: str
+    start: datetime, end: datetime, granularity: str, cuts: Sequence[datetime] = ()
 ) -> Iterator[tuple[datetime, datetime]]:
-    """Yield (bucket_start, bucket_end) windows covering [start, end)."""
+    """Yield (bucket_start, bucket_end) windows covering [start, end).
+
+    A bucket containing one of the ``cuts`` is split there, so anything that changes at an exact
+    instant (a commitment starting at 10:30) falls cleanly on one side of a bucket boundary.
+    """
     size = bucket_size(granularity)
     cursor = floor_to(start, granularity)
     end = as_utc(end)
+    ordered = sorted({as_utc(cut) for cut in cuts})
     while cursor < end:
-        yield cursor, cursor + size
-        cursor += size
+        bucket_end = cursor + size
+        edge = cursor
+        for cut in ordered:
+            if edge < cut < bucket_end:
+                yield edge, cut
+                edge = cut
+        yield edge, bucket_end
+        cursor = bucket_end
 
 
-def overlap_seconds(
+def microseconds(delta: timedelta) -> int:
+    """A duration as an integer count of microseconds, so no float enters the proration maths."""
+    return delta // MICROSECOND
+
+
+def overlap_microseconds(
     a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime
-) -> float:
+) -> int:
     start = max(as_utc(a_start), as_utc(b_start))
     end = min(as_utc(a_end), as_utc(b_end))
-    return max((end - start).total_seconds(), 0.0)
+    return max(microseconds(end - start), 0)
