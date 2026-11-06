@@ -8,11 +8,15 @@ units, i.e. after the free quantity has been consumed.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Context, Decimal
+from fractions import Fraction
+from math import floor
 
 ZERO = Decimal("0")
 CHARGE_PLACES = Decimal("0.000001")  # per-bucket charges keep 6 decimals
 MONEY_PLACES = Decimal("0.01")  # invoice lines/totals are rounded once, at the end
+# Wide enough that a NUMERIC(24, 8) quantity times a NUMERIC(24, 8) price is never rounded.
+EXACT = Context(prec=60, rounding=ROUND_HALF_UP)
 
 
 def D(value) -> Decimal:  # noqa: N802 - short constructor on purpose
@@ -25,6 +29,23 @@ def quantize_charge(amount: Decimal) -> Decimal:
 
 def quantize_money(amount: Decimal) -> Decimal:
     return amount.quantize(MONEY_PLACES, rounding=ROUND_HALF_UP)
+
+
+def extended_amount(quantity: Decimal, unit_price: Decimal) -> Decimal:
+    """``quantity x unit_price`` with no rounding from the ambient decimal context."""
+    return EXACT.multiply(D(quantity), D(unit_price))
+
+
+def prorate(value: Decimal, part: int, whole: int) -> Decimal:
+    """``value x part / whole``, rounded half-up once to six decimals.
+
+    The ratio is usually not representable (16 days of a 31-day month), so it is evaluated as a
+    fraction and rounded a single time rather than carrying a truncated decimal through.
+    """
+    if whole <= 0:
+        raise ValueError("whole must be positive")
+    scaled = Fraction(D(value)) * part / whole / Fraction(CHARGE_PLACES)
+    return EXACT.multiply(Decimal(floor(scaled + Fraction(1, 2))), CHARGE_PLACES)
 
 
 @dataclass(frozen=True)

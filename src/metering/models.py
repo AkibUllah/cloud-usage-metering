@@ -144,6 +144,29 @@ class Discount(Base):
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
 
 
+class Commitment(Base):
+    """A prepaid block of one metric: ``quantity`` units per billing period at ``unit_price``.
+
+    ``region`` limits it to one region; ``None`` covers usage in every region. The commitment runs
+    over ``[starts_at, ends_at)`` and an open ``ends_at`` means it has no fixed end.
+    """
+
+    __tablename__ = "commitments"
+    __table_args__ = (Index("ix_commitments_tenant_window", "tenant_id", "starts_at", "ends_at"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    metric: Mapped[str] = mapped_column(String(128), nullable=False)
+    region: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    quantity: Mapped[Decimal] = mapped_column(Money, nullable=False)
+    unit_price: Mapped[Decimal] = mapped_column(Money, nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), nullable=False)
+    starts_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False)
+    ends_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+    description: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
 class Invoice(Base):
     __tablename__ = "invoices"
     __table_args__ = (UniqueConstraint("tenant_id", "period", name="uq_invoice_tenant_period"),)
